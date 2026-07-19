@@ -12,6 +12,7 @@ import '../core/phash.dart';
 import '../db/database.dart';
 
 enum ProcessingMode { resolution, manual, database }
+enum ResolutionScanMode { hybrid, keyframe, fullFrame }
 
 enum ProcessStatus { idle, processing, done, error, cancelled }
 
@@ -30,7 +31,7 @@ class ProcessingState extends ChangeNotifier {
   List<AdInterval> _keepIntervals = [];
   List<RemovedSegment> _removedSegments = [];
   double _totalDuration = 0;
-  bool keyframeOnly = false;
+  ResolutionScanMode scanMode = ResolutionScanMode.hybrid;
   int parallelism = 4;
   double? detectStartTime;
   double? detectEndTime;
@@ -41,8 +42,8 @@ class ProcessingState extends ChangeNotifier {
   List<AdDetectionResult>? detectionResults;
   String? detectionReportPath;
 
-  void toggleFrames(bool v) {
-    keyframeOnly = v;
+  void setScanMode(ResolutionScanMode m) {
+    scanMode = m;
     notifyListeners();
   }
 
@@ -145,32 +146,37 @@ class ProcessingState extends ChangeNotifier {
   }
 
   Future<void> _processByResolution(String videoPath) async {
-    // phase 1: count frames for progress
-    appendLog('Estimating frame count (${keyframeOnly ? "keyframes" : "all frames"})...');
-    final totalFrames = await VideoProcessor.getFrameCount(videoPath, keyframeOnly: keyframeOnly);
+    final useKf = scanMode != ResolutionScanMode.fullFrame;
+    final modeLabel = scanMode == ResolutionScanMode.hybrid ? 'hybrid' : (useKf ? 'key' : 'all');
+    appendLog('Estimating frame count ($modeLabel)...');
+    final totalFrames = await VideoProcessor.getFrameCount(videoPath, keyframeOnly: useKf);
     if (VideoProcessor.isCancelled) return;
     appendLog('Estimated total: $totalFrames');
     progress = 0.02;
     notifyListeners();
-
-    // phase 2: streaming analysis (0.02 ~ 0.30)
     appendLog('Analyzing frame resolutions...');
-    final csv = await VideoProcessor.analyzeResolutions(
-      videoPath,
-      keyframeOnly: keyframeOnly,
-      onFrame: (count) {
-        if (VideoProcessor.isCancelled) return;
-        if (totalFrames > 0) {
-          progress = 0.02 + 0.28 * (count / totalFrames);
-          final pct = (count * 100 / totalFrames).toStringAsFixed(1);
-          setProgressLine('  $modeStr frame $count/$totalFrames ($pct%)');
-        }
-        notifyListeners();
-      },
-      onResolutionChange: (pts, w, h) {
-        appendLog('  突变: ${_fmtTime(pts)} → ${w}x$h');
-      },
-    );
+
+    String csv;
+    if (scanMode == ResolutionScanMode.hybrid) {
+      csv = await _analyzeHybrid(videoPath);
+    } else {
+      csv = await VideoProcessor.analyzeResolutions(
+        videoPath,
+        keyframeOnly: useKf,
+        onFrame: (count) {
+          if (VideoProcessor.isCancelled) return;
+          if (totalFrames > 0) {
+            progress = 0.02 + 0.28 * (count / totalFrames);
+            final pct = (count * 100 / totalFrames).toStringAsFixed(1);
+            setProgressLine('  $modeLabel frame $count/$totalFrames ($pct%)');
+          }
+          notifyListeners();
+        },
+        onResolutionChange: (pts, w, h) {
+          appendLog('  突变: ${_fmtTime(pts)} → ${w}x$h');
+        },
+      );
+    }
 
     if (VideoProcessor.isCancelled) return;
     final frames = ResolutionAnalyzer.parseFfprobeOutput(csv);
@@ -243,6 +249,61 @@ class ProcessingState extends ChangeNotifier {
     appendLog('Done! Output: $output');
     progress = 0.95;
     notifyListeners();
+  }
+
+  Future<String> _analyzeHybrid(String videoPath) async {
+    // Phase 1: keyframe scan
+    appendLog('  Phase 1: keyframe scan...');
+    final kfCsv = await VideoProcessor.analyzeResolutions(
+      videoPath,
+      keyframeOnly: true,
+      onFrame: (count) => setProgressLine('  keyframe scan: $count'),
+      onResolutionChange: (pts, w, h) {
+        appendLog('  突变: ${_fmtTime(pts)} → ${w}x$h');
+      },
+    );
+    if (VideoProcessor.isCancelled) return '';
+    final keyframes = ResolutionAnalyzer.parseFfprobeOutput(kfCsv);
+    if (keyframes.isEmpty) return kfCsv;
+
+    var segs = ResolutionAnalyzer.segmentByResolution(keyframes);
+    final mainRes = ResolutionAnalyzer.findMainResolution(segs, keyframes);
+
+    // Collect boundary windows around non-main segments
+    const margin = 2.0;
+    final windows = <(double, double)>[];
+    for (final seg in segs) {
+      if (seg.width != mainRes.$1 || seg.height != mainRes.$2) {
+        final start = (keyframes[seg.startIdx].ptsTime - margin).clamp(0.0, double.infinity);
+        final end = keyframes[seg.endIdx].ptsTime + margin;
+        if (windows.isNotEmpty && start <= windows.last.$2) {
+          windows[windows.length - 1] = (windows.last.$1, end > windows.last.$2 ? end : windows.last.$2);
+        } else {
+          windows.add((start, end));
+        }
+      }
+    }
+
+    if (windows.isEmpty) return kfCsv;
+
+    // Phase 2: full-frame scan on each window
+    appendLog('  Phase 2: scanning ${windows.length} boundary area(s)...');
+    final csvs = <String>[kfCsv];
+    for (int i = 0; i < windows.length; i++) {
+      if (VideoProcessor.isCancelled) return '';
+      final w = windows[i];
+      appendLog('    window ${i + 1}: ${_fmt(w.$1)} ~ ${_fmt(w.$2)}');
+      final wCsv = await VideoProcessor.scanTimeRange(
+        videoPath, w.$1, w.$2,
+        keyframeOnly: false,
+        onFrame: (count) => setProgressLine('  boundary scan $i: $count frames'),
+        onResolutionChange: (pts, w2, h2) {
+          appendLog('    精确边界: ${_fmtTime(pts)} → ${w2}x$h2');
+        },
+      );
+      csvs.add(wCsv);
+    }
+    return ResolutionAnalyzer.mergeCsvSegments(csvs);
   }
 
   /// Detection-only step with full status/error handling (database mode)
@@ -564,7 +625,13 @@ class ProcessingState extends ChangeNotifier {
     return Phash.compute(raw);
   }
 
-  String get modeStr => keyframeOnly ? 'key' : 'all';
+  String get modeStr {
+    switch (scanMode) {
+      case ResolutionScanMode.hybrid: return 'hybrid';
+      case ResolutionScanMode.keyframe: return 'key';
+      case ResolutionScanMode.fullFrame: return 'all';
+    }
+  }
 
   /// Create output dirs under video's parent: [outputDirName]/ and [outputDirName]/json/
   Future<Directory> _ensureOutputDirs(String videoPath) async {

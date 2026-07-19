@@ -233,13 +233,11 @@ class _SinglePageState extends State<SinglePage> {
                 if (state.mode == ProcessingMode.resolution)
                   Row(
                     children: [
-                      const Text('全帧', style: TextStyle(fontSize: 12)),
-                      Switch(
-                        value: state.keyframeOnly,
-                        onChanged: (v) => state.toggleFrames(v),
-                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
-                      const Text('关键帧', style: TextStyle(fontSize: 12)),
+                      _scanModeChip(state, ResolutionScanMode.hybrid, '混合'),
+                      const SizedBox(width: 4),
+                      _scanModeChip(state, ResolutionScanMode.fullFrame, '全帧'),
+                      const SizedBox(width: 4),
+                      _scanModeChip(state, ResolutionScanMode.keyframe, '关键帧'),
                     ],
                   ),
               ],
@@ -684,6 +682,17 @@ class _SinglePageState extends State<SinglePage> {
       case ProcessingMode.database:
         return '数据库指纹匹配';
     }
+  }
+
+  Widget _scanModeChip(ProcessingState state, ResolutionScanMode mode, String label) {
+    final selected = state.scanMode == mode;
+    return ChoiceChip(
+      label: Text(label, style: const TextStyle(fontSize: 12)),
+      selected: selected,
+      onSelected: state.status == ProcessStatus.processing ? null : (_) => state.setScanMode(mode),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    );
   }
 
   String _fmtDuration(double s) {
