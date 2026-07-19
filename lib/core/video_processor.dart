@@ -160,6 +160,75 @@ class VideoProcessor {
     return output.toString();
   }
 
+  /// Scan a specific time window with ffprobe.
+  /// Uses [onFrame] for progress and [onResolutionChange] for real-time resolution change events.
+  static Future<String> scanTimeRange(
+    String videoPath,
+    double startTime,
+    double endTime, {
+    bool keyframeOnly = false,
+    void Function(int count)? onFrame,
+    void Function(double ptsTime, int width, int height)? onResolutionChange,
+  }) async {
+    final args = [
+      '-v', 'quiet',
+      '-read_intervals', '${startTime.toStringAsFixed(3)}%+${(endTime - startTime).toStringAsFixed(3)}',
+      '-select_streams', 'v:0',
+      '-show_frames',
+      '-show_entries', 'frame=pts_time,width,height',
+      '-of', 'csv=p=0',
+      if (keyframeOnly) ...['-skip_frame', 'nokey'],
+      '-i', videoPath,
+    ];
+
+    if (Platform.isAndroid) {
+      return _execFFprobe(args);
+    }
+
+    await _initPaths();
+    _currentProcess = await Process.start(_ffprobePath!, args);
+
+    final output = StringBuffer();
+    int count = 0;
+    int? lastW, lastH;
+
+    await for (final line
+        in _currentProcess!.stdout.transform(utf8.decoder).transform(const LineSplitter())) {
+      if (_cancelRequested) {
+        _currentProcess?.kill();
+        _currentProcess = null;
+        throw ProcessCancelledException();
+      }
+      if (onResolutionChange != null) {
+        final parts = line.split(',');
+        if (parts.length >= 3) {
+          final pts = double.tryParse(parts[0]);
+          final w = int.tryParse(parts[1]);
+          final h = int.tryParse(parts[2]);
+          if (pts != null && w != null && h != null) {
+            if (lastW != null && (w != lastW || h != lastH)) {
+              onResolutionChange(pts, w, h);
+            }
+            lastW = w;
+            lastH = h;
+          }
+        }
+      }
+      output.writeln(line);
+      count++;
+      onFrame?.call(count);
+    }
+
+    final stderr = await _currentProcess!.stderr.transform(utf8.decoder).join();
+    final exitCode = await _currentProcess!.exitCode;
+    _currentProcess = null;
+    if (exitCode != 0) {
+      throw Exception('ffprobe window error (exit $exitCode): $stderr');
+    }
+
+    return output.toString();
+  }
+
   /// Parallel segmented ffprobe analysis using streaming Process.start per segment.
   /// [onResolutionChange] fires in real-time when width/height differs from previous frame.
   static Future<String> analyzeResolutionsParallel(
