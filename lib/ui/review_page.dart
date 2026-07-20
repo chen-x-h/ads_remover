@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../core/time_format.dart';
 import '../models/ad_detection_result.dart';
 import 'processing_state.dart';
 
@@ -151,7 +152,7 @@ class _DetectionCard extends StatelessWidget {
                       _showImage(context, result.videoFramePath!, '视频帧 $timeStr')),
                   if (result.videoEndFramePath != null)
                     _thumbWithLabel(result.videoEndFramePath, '视频尾', () =>
-                        _showImage(context, result.videoEndFramePath!, '视频帧(结束) ${_fmt(result.endTime)}')),
+                        _showImage(context, result.videoEndFramePath!, '视频帧(结束) ${fmtPrecise(result.endTime)}')),
                   _thumbWithLabel(result.sampleFramePath, '样本', () =>
                       _showImage(context, result.sampleFramePath!, '样本帧(开始)')),
                   if (result.sampleEndFramePath != null)
@@ -178,7 +179,7 @@ class _DetectionCard extends StatelessWidget {
                   ],
                 ),
                 Text(result.sampleName, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                Text('~${_fmt(result.endTime)}',
+                Text('~${fmtPrecise(result.endTime)}',
                     style: TextStyle(fontSize: 11, color: result.endMatched ? Colors.green : Colors.red)),
               ],
             ),
@@ -227,10 +228,4 @@ class _DetectionCard extends StatelessWidget {
     );
   }
 
-  String _fmt(double s) {
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toStringAsFixed(0).padLeft(2, '0')}';
-  }
 }

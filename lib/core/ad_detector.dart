@@ -2,17 +2,10 @@ import 'dart:async';
 import 'dart:isolate';
 import 'package:flutter/foundation.dart';
 import '../models/ad_sample.dart';
-import '../models/ad_interval.dart';
 import '../models/ad_detection_result.dart';
 import 'phash.dart';
 import 'video_processor.dart';
-
-String _hms(double s) {
-  final h = s ~/ 3600;
-  final m = (s % 3600) ~/ 60;
-  final sec = s % 60;
-  return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toStringAsFixed(0).padLeft(2, '0')}';
-}
+import 'time_format.dart';
 
 // --- Worker isolate: receives frame batches, sends progress & matches in real time ---
 void _hashWorker(SendPort mainPort) {
@@ -103,7 +96,7 @@ class AdDetector {
     final timeStep = 1.0 / outputFps;
 
     final rangeInfo = detectStart != null
-        ? ' [${_hms(detectStart!)} ~ ${_hms(detectEnd!)}]'
+        ? ' [${fmtTime(detectStart!)} ~ ${fmtTime(detectEnd!)}]'
         : '';
     debugPrint('[AdDetector] totalCheckable=$totalCheckable$rangeInfo');
 

@@ -1,6 +1,7 @@
 import 'dart:convert' show JsonEncoder;
-import 'dart:io' show File, Directory;
+import 'dart:io' show File, Directory, Platform;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:path/path.dart' as p;
 import '../models/ad_sample.dart';
 import '../models/ad_interval.dart';
@@ -9,6 +10,7 @@ import '../core/video_processor.dart';
 import '../core/resolution_analyzer.dart';
 import '../core/ad_detector.dart';
 import '../core/phash.dart';
+import '../core/time_format.dart';
 import '../db/database.dart';
 
 enum ProcessingMode { resolution, manual, database }
@@ -37,6 +39,11 @@ class ProcessingState extends ChangeNotifier {
   double? detectEndTime;
 
   String outputDirName = 'clean';
+  String? outputDirPath;
+  void setOutputDir(String? path) {
+    outputDirPath = path;
+    notifyListeners();
+  }
 
   // Detection review flow (database mode)
   List<AdDetectionResult>? detectionResults;
@@ -90,6 +97,7 @@ class ProcessingState extends ChangeNotifier {
     detectEndTime = null;
     detectionResults = null;
     detectionReportPath = null;
+
     notifyListeners();
   }
 
@@ -110,9 +118,16 @@ class ProcessingState extends ChangeNotifier {
     errorMessage = null;
     outputVideoPath = null;
     jsonReportPath = null;
+    appendLog('输入视频: $videoPath');
+    appendLog('输入文件存在: ${File(videoPath).existsSync()}');
+    debugPrint('[processVideo] videoPath=$videoPath exists=${File(videoPath).existsSync()}');
     notifyListeners();
 
     try {
+      // fetch duration early so _totalDuration is always valid
+      final dur = await VideoProcessor.getDuration(videoPath);
+      if (dur > 0) _totalDuration = dur;
+
       switch (mode) {
         case ProcessingMode.resolution:
           await _processByResolution(videoPath);
@@ -138,6 +153,7 @@ class ProcessingState extends ChangeNotifier {
       } else {
         status = ProcessStatus.error;
         errorMessage = e.toString();
+        debugPrint('[processVideo] ERROR: $e');
         appendLog('ERROR: $e');
       }
     }
@@ -173,14 +189,15 @@ class ProcessingState extends ChangeNotifier {
           notifyListeners();
         },
         onResolutionChange: (pts, w, h) {
-          appendLog('  突变: ${_fmtTime(pts)} → ${w}x$h');
+          appendLog('  突变: ${fmtTime(pts)} → ${w}x$h');
         },
       );
     }
 
     if (VideoProcessor.isCancelled) return;
+    debugPrint('[process] csv_len=${csv.length} csv_preview=${csv.length > 200 ? csv.substring(0, 200) : csv}');
     final frames = ResolutionAnalyzer.parseFfprobeOutput(csv);
-    if (frames.isEmpty) throw Exception('No frames detected');
+    if (frames.isEmpty) throw Exception('No frames detected (csv=${csv.length} chars)');
     appendLog('Frames analyzed: ${frames.length}');
     progress = 0.30;
     notifyListeners();
@@ -189,7 +206,7 @@ class ProcessingState extends ChangeNotifier {
     final segments = ResolutionAnalyzer.segmentByResolution(
       frames,
       onSegment: (seg, pts) {
-        appendLog('  分段: ${seg.width}x${seg.height} @ ${_fmtTime(pts)}');
+        appendLog('  分段: ${seg.width}x${seg.height} @ ${fmtTime(pts)}');
       },
     );
     appendLog('Resolution segments: ${segments.length}');
@@ -206,30 +223,29 @@ class ProcessingState extends ChangeNotifier {
     final (keep, removed) = ResolutionAnalyzer.buildIntervals(
       frames, segments, mainRes,
       onAdCandidate: (rs) {
-        appendLog('发现异常: ${_fmt(rs.start)} ~ ${_fmt(rs.end)} (${rs.reason})');
+        appendLog('发现异常: ${fmtPrecise(rs.start)} ~ ${fmtPrecise(rs.end)} (${rs.reason})');
       },
     );
 
     _keepIntervals = keep;
     _removedSegments = removed;
-    _totalDuration = frames.last.ptsTime;
     progress = 0.50;
     notifyListeners();
 
     if (VideoProcessor.isCancelled) return;
 
     if (removed.isEmpty) {
-      appendLog('No ads detected, nothing to remove.');
+      appendLog('No ads detected, copying original to output...');
       final outDir = await _ensureOutputDirs(videoPath);
-      final out = '${outDir.path}/not_detected_${p.basename(videoPath)}';
-      await File(videoPath).copy(out);
-      outputVideoPath = out;
+      final output = '${outDir.path}/no_detected_${p.basename(videoPath)}';
+      await File(videoPath).copy(output);
+      outputVideoPath = output;
       progress = 1.0;
       return;
     }
 
     for (final r in removed) {
-      appendLog('Remove: ${_fmt(r.start)} ~ ${_fmt(r.end)} (${r.reason})');
+      appendLog('Remove: ${fmtPrecise(r.start)} ~ ${fmtPrecise(r.end)} (${r.reason})');
     }
 
     if (keep.isEmpty) throw Exception('No content to keep');
@@ -259,7 +275,7 @@ class ProcessingState extends ChangeNotifier {
       keyframeOnly: true,
       onFrame: (count) => setProgressLine('  keyframe scan: $count'),
       onResolutionChange: (pts, w, h) {
-        appendLog('  突变: ${_fmtTime(pts)} → ${w}x$h');
+        appendLog('  突变: ${fmtTime(pts)} → ${w}x$h');
       },
     );
     if (VideoProcessor.isCancelled) return '';
@@ -292,13 +308,13 @@ class ProcessingState extends ChangeNotifier {
     for (int i = 0; i < windows.length; i++) {
       if (VideoProcessor.isCancelled) return '';
       final w = windows[i];
-      appendLog('    window ${i + 1}: ${_fmt(w.$1)} ~ ${_fmt(w.$2)}');
+      appendLog('    window ${i + 1}: ${fmtPrecise(w.$1)} ~ ${fmtPrecise(w.$2)}');
       final wCsv = await VideoProcessor.scanTimeRange(
         videoPath, w.$1, w.$2,
         keyframeOnly: false,
         onFrame: (count) => setProgressLine('  boundary scan $i: $count frames'),
         onResolutionChange: (pts, w2, h2) {
-          appendLog('    精确边界: ${_fmtTime(pts)} → ${w2}x$h2');
+          appendLog('    精确边界: ${fmtTime(pts)} → ${w2}x$h2');
         },
       );
       csvs.add(wCsv);
@@ -330,6 +346,7 @@ class ProcessingState extends ChangeNotifier {
       } else {
         status = ProcessStatus.error;
         errorMessage = e.toString();
+        debugPrint('[processOnlyDetection] ERROR: $e');
         appendLog('ERROR: $e');
       }
     }
@@ -352,7 +369,7 @@ class ProcessingState extends ChangeNotifier {
     notifyListeners();
 
     final rangeInfo = detectStartTime != null
-        ? ' [${_fmtTime(detectStartTime!)} ~ ${_fmtTime(detectEndTime!)}]'
+        ? ' [${fmtTime(detectStartTime!)} ~ ${fmtTime(detectEndTime!)}]'
         : '';
     appendLog('Detecting ads$rangeInfo...');
 
@@ -368,7 +385,7 @@ class ProcessingState extends ChangeNotifier {
         notifyListeners();
       },
       onMatch: (time, name) {
-        appendLog('疑似广告: ${_fmt(time)} (样本: $name)');
+        appendLog('疑似广告: ${fmtPrecise(time)} (样本: $name)');
       },
       isCancelled: () => VideoProcessor.isCancelled,
     );
@@ -376,10 +393,7 @@ class ProcessingState extends ChangeNotifier {
     if (VideoProcessor.isCancelled) return;
     if (detections.isEmpty) {
       appendLog('No ads detected.');
-      final outDir = await _ensureOutputDirs(videoPath);
-      final out = '${outDir.path}/not_detected_${p.basename(videoPath)}';
-      await File(videoPath).copy(out);
-      outputVideoPath = out;
+      outputVideoPath = videoPath;
       progress = 1.0;
       return;
     }
@@ -387,7 +401,7 @@ class ProcessingState extends ChangeNotifier {
     appendLog('Detected ${detections.length} candidates, saving frame images...');
 
     // Save frame images + verify end frames
-    final jsonDir = Directory('${File(videoPath).parent.path}/$outputDirName/json');
+    final jsonDir = Directory('${_resolveBase(videoPath)}/$outputDirName/json');
     if (!jsonDir.existsSync()) await jsonDir.create(recursive: true);
     final sampleDir = await DatabaseHelper.instance.getSampleDir();
 
@@ -437,7 +451,7 @@ class ProcessingState extends ChangeNotifier {
         confirmed: endOk,
       );
       if (!endOk) {
-        appendLog('  结尾不匹配: ${_fmt(d.startTime)} (${d.sampleName})');
+        appendLog('  结尾不匹配: ${fmtPrecise(d.startTime)} (${d.sampleName})');
       }
       if ((i + 1) % 5 == 0 || i == detections.length - 1) {
         progress = 0.50 + 0.20 * ((i + 1) / detections.length);
@@ -482,6 +496,7 @@ class ProcessingState extends ChangeNotifier {
       } else {
         status = ProcessStatus.error;
         errorMessage = e.toString();
+        debugPrint('[processOnlyTrimming] ERROR: $e');
         appendLog('ERROR: $e');
       }
     }
@@ -530,7 +545,7 @@ class ProcessingState extends ChangeNotifier {
     )).toList();
 
     for (final d in confirmed) {
-      appendLog('Ad: ${_fmt(d.startTime)} ~ ${_fmt(d.endTime)} (${d.sampleName})');
+      appendLog('Ad: ${fmtPrecise(d.startTime)} ~ ${fmtPrecise(d.endTime)} (${d.sampleName})');
     }
 
     final input = File(videoPath);
@@ -567,24 +582,25 @@ class ProcessingState extends ChangeNotifier {
   Future<void> _writeJsonReport(String videoPath) async {
     final input = File(videoPath);
     await _ensureOutputDirs(videoPath);
-    final jsonPath = '${input.parent.path}/$outputDirName/json/${p.basenameWithoutExtension(input.path)}_ads_report.json';
+    final base = _resolveBase(videoPath);
+    final jsonPath = '$base/$outputDirName/json/${p.basenameWithoutExtension(input.path)}_ads_report.json';
 
     final report = <String, dynamic>{
       'input_file': videoPath,
       'output_file': outputVideoPath,
       'mode': mode.name,
       'processed_at': DateTime.now().toIso8601String(),
-      'total_duration': '${_fmtTime(_totalDuration)} (${_totalDuration}s)',
+      'total_duration': '${fmtTime(_totalDuration)} (${_totalDuration}s)',
       'ads_removed': _removedSegments.map((r) => {
-        'start': _fmtTime(r.start),
-        'end': _fmtTime(r.end),
-        'duration': '${_fmtTime(r.end - r.start)} (${(r.end - r.start).toStringAsFixed(1)}s)',
+        'start': fmtTime(r.start),
+        'end': fmtTime(r.end),
+        'duration': '${fmtTime(r.end - r.start)} (${(r.end - r.start).toStringAsFixed(1)}s)',
         'reason': r.reason,
       }).toList(),
       'segments_kept': _keepIntervals.map((k) => {
-        'start': _fmtTime(k.start),
-        'end': _fmtTime(k.end),
-        'duration': '${_fmtTime(k.duration)} (${k.duration.toStringAsFixed(1)}s)',
+        'start': fmtTime(k.start),
+        'end': fmtTime(k.end),
+        'duration': '${fmtTime(k.duration)} (${k.duration.toStringAsFixed(1)}s)',
       }).toList(),
     };
 
@@ -633,27 +649,32 @@ class ProcessingState extends ChangeNotifier {
     }
   }
 
-  /// Create output dirs under video's parent: [outputDirName]/ and [outputDirName]/json/
+  /// Resolve base directory: use outputDirPath or source parent, but never cache
+  String _resolveBase(String videoPath) {
+    final base = outputDirPath ?? File(videoPath).parent.path;
+    if (Platform.isAndroid && (base.startsWith('/data/') || base.contains('/cache/'))) {
+      return '/storage/emulated/0';
+    }
+    return base;
+  }
+
   Future<Directory> _ensureOutputDirs(String videoPath) async {
-    final parent = File(videoPath).parent.path;
-    final dir = Directory('$parent/$outputDirName');
+    final base = _resolveBase(videoPath);
+    final dir = Directory('$base/$outputDirName');
     if (!dir.existsSync()) await dir.create(recursive: true);
-    final jsonDir = Directory('$parent/$outputDirName/json');
+    final jsonDir = Directory('$base/$outputDirName/json');
     if (!jsonDir.existsSync()) await jsonDir.create(recursive: true);
+    debugPrint('[ensureOutputDirs] base=$base outputDirName=$outputDirName videoPath=$videoPath');
     return dir;
   }
 
-  String _fmtTime(double s) {
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toStringAsFixed(0).padLeft(2, '0')}';
+  /// Open Android All Files Access settings page (API 30+)
+  static Future<void> requestAllFilesAccess() async {
+    if (!Platform.isAndroid) return;
+    try {
+      const channel = MethodChannel('com.example.ads_remover/native');
+      await channel.invokeMethod('openAllFilesAccessSettings');
+    } catch (_) {}
   }
 
-  String _fmt(double s) {
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toStringAsFixed(3).padLeft(6, '0')}';
-  }
 }

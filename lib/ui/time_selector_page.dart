@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../core/video_processor.dart';
+import '../core/time_format.dart';
 import 'processing_state.dart';
 
 class TimeSelectorPage extends StatefulWidget {
@@ -201,7 +202,7 @@ class _TimeSelectorPageState extends State<TimeSelectorPage> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Text(
-                    _startSet ? _fmtTime(_startTime) : '--:--:--',
+                    _startSet ? fmtTime(_startTime) : '--:--:--',
                     style: TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
@@ -213,7 +214,7 @@ class _TimeSelectorPageState extends State<TimeSelectorPage> {
                     child: Text('~', style: TextStyle(fontSize: 24)),
                   ),
                   Text(
-                    _endSet ? _fmtTime(_endTime) : '--:--:--',
+                    _endSet ? fmtTime(_endTime) : '--:--:--',
                     style: TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
@@ -256,17 +257,11 @@ class _TimeSelectorPageState extends State<TimeSelectorPage> {
     final end = _startTime < _endTime ? _endTime : _startTime;
     context.read<ProcessingState>().addManualSample(widget.videoPath, start, end);
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('样本已添加: ${_fmtTime(start)} ~ ${_fmtTime(end)}')),
+      SnackBar(content: Text('样本已添加: ${fmtTime(start)} ~ ${fmtTime(end)}')),
     );
     Navigator.pop(context);
   }
 
-  String _fmtTime(double s) {
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toStringAsFixed(0).padLeft(2, '0')}';
-  }
 }
 
 class _TimeField extends StatelessWidget {

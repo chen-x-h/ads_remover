@@ -1,11 +1,12 @@
 import 'dart:io' show Platform, Directory, File;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show SchedulerBinding;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:provider/provider.dart';
 import 'package:file_selector/file_selector.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
 import '../core/video_processor.dart';
+import '../core/time_format.dart';
 import 'processing_state.dart';
 import 'time_selector_page.dart';
 import 'review_page.dart';
@@ -77,18 +78,23 @@ class _SinglePageState extends State<SinglePage> {
   }
 
   Future<void> _pickFile() async {
-    if (Platform.isAndroid || Platform.isIOS) {
-      final picker = ImagePicker();
-      final result = await picker.pickVideo(source: ImageSource.gallery);
-      if (result != null) {
+    if (Platform.isAndroid) {
+      // Android: use native channel (no OOM, no cache copy)
+      const ch = MethodChannel('com.example.ads_remover/native');
+      final result = await ch.invokeMethod<Map>('pickVideo');
+      if (result != null && mounted) {
+        final videoPath = result['path'] as String;
         setState(() {
           _fileSelected = true;
-          _fileName = result.path;
+          _fileName = videoPath;
         });
-        _loadDuration(result.path);
+        _loadDuration(videoPath);
+        final parent = File(videoPath).parent.path;
+        context.read<ProcessingState>().setOutputDir(parent);
       }
     } else {
-      final result = await openFile(
+      // Desktop: use file_selector
+      final xfile = await openFile(
         acceptedTypeGroups: [
           XTypeGroup(
             label: 'Video',
@@ -96,13 +102,21 @@ class _SinglePageState extends State<SinglePage> {
           ),
         ],
       );
-      if (result != null) {
+      if (xfile != null) {
         setState(() {
           _fileSelected = true;
-          _fileName = result.path;
+          _fileName = xfile.path;
         });
-        _loadDuration(result.path);
+        _loadDuration(xfile.path);
+        _pickOutputDirDesktop();
       }
+    }
+  }
+
+  Future<void> _pickOutputDirDesktop() async {
+    final dir = await getDirectoryPath();
+    if (dir != null && mounted) {
+      context.read<ProcessingState>().setOutputDir(dir);
     }
   }
 
@@ -178,7 +192,7 @@ class _SinglePageState extends State<SinglePage> {
                       Padding(
                         padding: const EdgeInsets.only(top: 8, left: 40),
                         child: Text(
-                          '时长: ${_fmtDuration(_duration)}',
+                          '时长: ${fmtTime(_duration)}',
                           style: TextStyle(color: Colors.grey[600]),
                         ),
                       ),
@@ -245,24 +259,60 @@ class _SinglePageState extends State<SinglePage> {
             if (state.mode != ProcessingMode.manual)
               Padding(
                 padding: const EdgeInsets.only(top: 4),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('输出目录: ', style: TextStyle(fontSize: 12)),
-                    SizedBox(
-                      width: 100,
-                      child: TextField(
-                        controller: _outputDirCtrl,
-                        style: const TextStyle(fontSize: 12),
-                        decoration: const InputDecoration(
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                          border: OutlineInputBorder(),
+                    Row(
+                      children: [
+                        const Text('子目录: ', style: TextStyle(fontSize: 12)),
+                        SizedBox(
+                          width: 80,
+                          child: TextField(
+                            controller: _outputDirCtrl,
+                            style: const TextStyle(fontSize: 12),
+                            decoration: const InputDecoration(
+                              isDense: true,
+                              contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                              border: OutlineInputBorder(),
+                            ),
+                            onChanged: (v) {
+                              context.read<ProcessingState>().outputDirName =
+                                  v.isNotEmpty ? v : 'clean';
+                            },
+                          ),
                         ),
-                        onChanged: (v) {
-                          context.read<ProcessingState>().outputDirName =
-                              v.isNotEmpty ? v : 'clean';
-                        },
-                      ),
+                        const SizedBox(width: 8),
+                        const Text('基目录: ', style: TextStyle(fontSize: 12)),
+                        Expanded(
+                          child: Text(
+                            Platform.isAndroid
+                                ? '源文件目录'
+                                : (state.outputDirPath ?? '(视频同目录)'),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (!Platform.isAndroid) ...[
+                          IconButton(
+                            icon: const Icon(Icons.folder_open, size: 18),
+                            onPressed: _pickOutputDirDesktop,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
+                          ),
+                          if (state.outputDirPath != null)
+                            IconButton(
+                              icon: const Icon(Icons.clear, size: 18),
+                              onPressed: () {
+                                context.read<ProcessingState>().setOutputDir(null);
+                              },
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(),
+                            ),
+                        ],
+                      ],
                     ),
                   ],
                 ),
@@ -416,7 +466,42 @@ class _SinglePageState extends State<SinglePage> {
                   Expanded(
                     child: ElevatedButton.icon(
                       onPressed: _fileSelected && state.status != ProcessStatus.processing
-                          ? () => state.processVideo(_fileName)
+                          ? () async {
+                              // Android 11+: check All Files Access (MANAGE_EXTERNAL_STORAGE)
+                              if (Platform.isAndroid) {
+                                try {
+                                  const ch = MethodChannel('com.example.ads_remover/native');
+                                  final ok = await ch.invokeMethod<bool>('hasAllFilesAccess');
+                                  if (ok != true) {
+                                    await showDialog(
+                                      context: context,
+                                      builder: (ctx) => AlertDialog(
+                                        title: const Text('需要所有文件访问权限'),
+                                        content: const Text(
+                                          'Android 11+ 限制直接写外部存储。\n\n'
+                                          '请在设置中授予「所有文件访问权限」以允许本应用写入文件。'
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                            onPressed: () => Navigator.pop(ctx),
+                                            child: const Text('取消'),
+                                          ),
+                                          FilledButton(
+                                            onPressed: () {
+                                              ProcessingState.requestAllFilesAccess();
+                                              Navigator.pop(ctx);
+                                            },
+                                            child: const Text('去设置'),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                    return; // wait for user to grant and retry
+                                  }
+                                } catch (_) {}
+                              }
+                              state.processVideo(_fileName);
+                            }
                           : null,
                       icon: Icon(state.status == ProcessStatus.processing
                           ? Icons.hourglass_top
@@ -695,10 +780,4 @@ class _SinglePageState extends State<SinglePage> {
     );
   }
 
-  String _fmtDuration(double s) {
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toStringAsFixed(0).padLeft(2, '0')}';
-  }
 }
